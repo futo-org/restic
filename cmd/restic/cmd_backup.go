@@ -60,6 +60,13 @@ Exit status is 12 if the password is incorrect.
 				}
 				opts.ReadConcurrency = uint(n)
 			}
+			if envVal := os.Getenv("RESTIC_WALK_CONCURRENCY"); envVal != "" && !opts.walkConcurrencyFlag.Changed {
+				n, err := strconv.ParseUint(envVal, 10, 32)
+				if err != nil {
+					return errors.Fatalf("invalid value for RESTIC_WALK_CONCURRENCY %q: %v", envVal, err)
+				}
+				opts.WalkConcurrency = uint(n)
+			}
 			if opts.Host == "" {
 				hostname, err := os.Hostname()
 				if err != nil {
@@ -108,10 +115,12 @@ type BackupOptions struct {
 	UseFsSnapshot     bool
 	DryRun            bool
 	ReadConcurrency   uint
+	WalkConcurrency   uint
 	NoScan            bool
 	SkipIfUnchanged   bool
 
 	readConcurrencyFlag *pflag.Flag
+	walkConcurrencyFlag *pflag.Flag
 }
 
 func (opts *BackupOptions) AddFlags(f *pflag.FlagSet) {
@@ -131,6 +140,7 @@ func (opts *BackupOptions) AddFlags(f *pflag.FlagSet) {
 	f.BoolVar(&opts.StdinCommand, "stdin-from-command", false, "interpret arguments as command to execute and store its stdout")
 	f.Var(&opts.Tags, "tag", "add `tags` for the new snapshot in the format `tag[,tag,...]` (can be specified multiple times)")
 	f.UintVar(&opts.ReadConcurrency, "read-concurrency", 0, "read `n` files concurrently (default: $RESTIC_READ_CONCURRENCY or 2)")
+	f.UintVar(&opts.WalkConcurrency, "walk-concurrency", 0, "inspect `n` directory entries concurrently (default: $RESTIC_WALK_CONCURRENCY or 1)")
 	f.StringVarP(&opts.Host, "host", "H", "", "set the `hostname` for the snapshot manually (default: $RESTIC_HOST). To prevent an expensive rescan use the \"parent\" flag")
 	f.StringVar(&opts.Host, "hostname", "", "set the `hostname` for the snapshot manually")
 	err := f.MarkDeprecated("hostname", "use --host")
@@ -156,6 +166,7 @@ func (opts *BackupOptions) AddFlags(f *pflag.FlagSet) {
 	f.BoolVar(&opts.SkipIfUnchanged, "skip-if-unchanged", false, "skip snapshot creation if identical to parent snapshot")
 
 	opts.readConcurrencyFlag = f.Lookup("read-concurrency")
+	opts.walkConcurrencyFlag = f.Lookup("walk-concurrency")
 
 	// parse host from env, if not exists or empty the default value will be used
 	if host := os.Getenv("RESTIC_HOST"); host != "" {
@@ -645,7 +656,7 @@ func runBackup(ctx context.Context, opts BackupOptions, gopts global.Options, te
 		wg.Go(func() error { return sc.Scan(cancelCtx, targets) })
 	}
 
-	arch := archiver.New(repo, targetFS, archiver.Options{ReadConcurrency: opts.ReadConcurrency})
+	arch := archiver.New(repo, targetFS, archiver.Options{ReadConcurrency: opts.ReadConcurrency, WalkConcurrency: opts.WalkConcurrency})
 	arch.SelectByName = selectByNameFilter
 	arch.Select = selectFilter
 	arch.WithAtime = opts.WithAtime

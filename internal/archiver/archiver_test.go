@@ -2396,9 +2396,10 @@ func TestArchiverAbortEarlyOnError(t *testing.T) {
 				err:          testErr,
 			}
 
-			// at most two files may be queued
+			// at most two files may be queued, and only one entry is inspected at a time
 			arch := New(testRepo, testFS, Options{
 				ReadConcurrency: 2,
+				WalkConcurrency: 1,
 			})
 			arch.Error = func(item string, err error) error {
 				t.Logf("archiver error for %q: %v", item, err)

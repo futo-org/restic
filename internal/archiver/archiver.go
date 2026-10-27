@@ -98,6 +98,7 @@ type Archiver struct {
 
 	fileSaver *fileSaver
 	treeSaver *treeSaver
+	walkers   chan struct{}
 	mu        sync.Mutex
 	summary   *Summary
 
@@ -147,6 +148,12 @@ type Options struct {
 	// SaveTreeConcurrency sets how many trees are marshalled and saved to the
 	// repo concurrently.
 	SaveTreeConcurrency uint
+
+	// WalkConcurrency sets how many directory entries are inspected (opened,
+	// stat'ed and their extended attributes read) concurrently. One keeps the
+	// sequential walk; higher values hide filesystem latency, which dominates
+	// incremental backups of network filesystems.
+	WalkConcurrency uint
 }
 
 // ApplyDefaults returns a copy of o with the default options set for all unset
@@ -168,6 +175,10 @@ func (o Options) ApplyDefaults() Options {
 		o.SaveTreeConcurrency = uint(runtime.GOMAXPROCS(0)) + o.ReadConcurrency
 	}
 
+	if o.WalkConcurrency == 0 {
+		o.WalkConcurrency = 1
+	}
+
 	return o
 }
 
@@ -185,7 +196,50 @@ func New(repo archiverRepo, filesystem fs.FS, opts Options) *Archiver {
 		CompleteBlob: func(uint64) {},
 	}
 
+	if arch.Options.WalkConcurrency > 1 {
+		arch.walkers = make(chan struct{}, arch.Options.WalkConcurrency-1)
+	}
+
 	return arch
+}
+
+// tryStartWalker reserves one of the additional walker goroutines. It never
+// blocks: when all are busy, the caller inspects the entry itself, which bounds
+// the number of goroutines without the risk of a deadlock.
+func (arch *Archiver) tryStartWalker() bool {
+	if arch.walkers == nil {
+		return false
+	}
+	select {
+	case arch.walkers <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (arch *Archiver) stopWalker() {
+	<-arch.walkers
+}
+
+type pendingEntry struct {
+	pathname string
+	fn       futureNode
+	excluded bool
+	err      error
+	done     chan struct{}
+}
+
+func (e *pendingEntry) wait(ctx context.Context) error {
+	if e.done == nil {
+		return nil
+	}
+	select {
+	case <-e.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // error calls arch.Error if it is set and the error is different from context.Canceled.
@@ -315,24 +369,37 @@ func (arch *Archiver) saveDir(ctx context.Context, snPath string, dir string, me
 		return futureNode{}, err
 	}
 
-	nodes := make([]futureNode, 0, len(names))
+	entries := make([]*pendingEntry, 0, len(names))
+	// Never leave walkers behind: on an error they would keep inspecting
+	// entries after the backup has returned.
+	defer func() {
+		for _, entry := range entries {
+			if entry.done != nil {
+				<-entry.done
+			}
+		}
+	}()
 
 	finder := data.NewTreeFinder(previous)
 	defer finder.Close()
 
-	var lastExcluded string
-
-	for _, name := range names {
+	for i, name := range names {
 		// test if context has been cancelled
 		if ctx.Err() != nil {
 			debug.Log("context has been cancelled, aborting")
 			return futureNode{}, ctx.Err()
 		}
 
-		if name == lastExcluded {
+		if i > 0 && name == names[i-1] && len(entries) > 0 {
 			// Skip duplicate directory entry if it was already excluded.
 			// This avoids printing errors about duplicate directory entries even though the entry in question is ignored.
-			continue
+			last := entries[len(entries)-1]
+			if err := last.wait(ctx); err != nil {
+				return futureNode{}, err
+			}
+			if last.err == nil && last.excluded {
+				continue
+			}
 		}
 
 		pathname := arch.FS.Join(dir, name)
@@ -342,11 +409,34 @@ func (arch *Archiver) saveDir(ctx context.Context, snPath string, dir string, me
 			return futureNode{}, err
 		}
 		snItem := join(snPath, name)
-		fn, excluded, err := arch.save(ctx, snItem, pathname, oldNode, false)
+		entry := &pendingEntry{pathname: pathname}
+		entries = append(entries, entry)
+
+		if arch.tryStartWalker() {
+			entry.done = make(chan struct{})
+			go func() {
+				defer arch.stopWalker()
+				defer close(entry.done)
+				entry.fn, entry.excluded, entry.err = arch.save(ctx, snItem, pathname, oldNode, false)
+			}()
+			continue
+		}
+
+		entry.fn, entry.excluded, entry.err = arch.save(ctx, snItem, pathname, oldNode, false)
+	}
+
+	// Every entry has to finish before this tree is queued: the tree saver must
+	// receive subtrees before the trees containing them, as in a sequential
+	// walk, or its workers can end up waiting on each other.
+	nodes := make([]futureNode, 0, len(entries))
+	for _, entry := range entries {
+		if err := entry.wait(ctx); err != nil {
+			return futureNode{}, err
+		}
 
 		// return error early if possible
-		if err != nil {
-			err = arch.error(pathname, err)
+		if entry.err != nil {
+			err := arch.error(entry.pathname, entry.err)
 			if err == nil {
 				// ignore error
 				continue
@@ -355,12 +445,11 @@ func (arch *Archiver) saveDir(ctx context.Context, snPath string, dir string, me
 			return futureNode{}, err
 		}
 
-		if excluded {
-			lastExcluded = name
+		if entry.excluded {
 			continue
 		}
 
-		nodes = append(nodes, fn)
+		nodes = append(nodes, entry.fn)
 	}
 
 	fn := arch.treeSaver.Save(ctx, snPath, dir, treeNode, nodes, complete)
