@@ -1,0 +1,16 @@
+# The restic binary FUTO Backups ships, published by .github/workflows/futo-image.yml.
+# Unlike Dockerfile.release it leaves out self-update, which would replace this
+# build with an upstream release.
+FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine3.23@sha256:895e5feab11a4b3774d24ee3c9579028456b82ad37f42a9eb6f82adaf776a201 AS build
+ARG TARGETOS
+ARG TARGETARCH
+WORKDIR /restic
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+    go build -trimpath -ldflags "-s -w" -tags disable_grpc_modules -o /out/restic ./cmd/restic
+
+FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+COPY --from=build /out/restic /usr/bin/restic
+ENTRYPOINT ["/usr/bin/restic"]
