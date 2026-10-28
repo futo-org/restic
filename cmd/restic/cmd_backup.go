@@ -649,6 +649,7 @@ func runBackup(ctx context.Context, opts BackupOptions, gopts global.Options, te
 		sc.Select = selectFilter
 		sc.Error = printer.ScannerError
 		sc.Result = progressReporter.ReportTotal
+		sc.Concurrency = opts.WalkConcurrency
 
 		if !gopts.JSON {
 			printer.V("start scan on %v", targets)

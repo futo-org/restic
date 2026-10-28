@@ -7,7 +7,8 @@ files were slow even when no file had to be read.
 
 Restic now supports `backup --walk-concurrency n`, or the environment variable
 `RESTIC_WALK_CONCURRENCY`, to inspect up to `n` directory entries at the same
-time. The default of 1 keeps the previous behavior. The stored trees are the
-same for any value.
+time. The scan that computes the size of the backup for the progress output
+uses the same concurrency, so it finishes before the backup does. The default
+of 1 keeps the previous behavior. The stored trees are the same for any value.
 
 https://github.com/restic/restic/issues/2275

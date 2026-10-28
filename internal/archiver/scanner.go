@@ -3,6 +3,7 @@ package archiver
 import (
 	"context"
 	"sort"
+	"sync"
 
 	"github.com/restic/restic/internal/debug"
 	"github.com/restic/restic/internal/fs"
@@ -17,6 +18,15 @@ type Scanner struct {
 	Select       SelectFunc
 	Error        ErrorFunc
 	Result       func(item string, s ScanStats)
+
+	// Concurrency sets how many directory entries are scanned at the same
+	// time, like Options.WalkConcurrency does for the archiver. Zero and one
+	// scan sequentially.
+	Concurrency uint
+
+	mu      sync.Mutex
+	total   ScanStats
+	walkers chan struct{}
 }
 
 // NewScanner initializes a new Scanner.
@@ -36,36 +46,29 @@ type ScanStats struct {
 	Bytes               uint64
 }
 
-func (s *Scanner) scanTree(ctx context.Context, stats ScanStats, tree tree) (ScanStats, error) {
+func (s *Scanner) scanTree(ctx context.Context, tree tree) error {
 	// traverse the path in the file system for all leaf nodes
 	if tree.Leaf() {
 		abstarget, err := s.FS.Abs(tree.Path)
 		if err != nil {
-			return ScanStats{}, err
+			return err
 		}
 
-		stats, err = s.scan(ctx, stats, abstarget, tree.Explicit)
-		if err != nil {
-			return ScanStats{}, err
-		}
-
-		return stats, nil
+		return s.scan(ctx, abstarget, tree.Explicit)
 	}
 
 	// otherwise recurse into the nodes in a deterministic order
 	for _, name := range tree.NodeNames() {
-		var err error
-		stats, err = s.scanTree(ctx, stats, tree.Nodes[name])
-		if err != nil {
-			return ScanStats{}, err
+		if err := s.scanTree(ctx, tree.Nodes[name]); err != nil {
+			return err
 		}
 
 		if ctx.Err() != nil {
-			return stats, nil
+			return nil
 		}
 	}
 
-	return stats, nil
+	return nil
 }
 
 // Scan traverses the targets. The function Result is called for each new item
@@ -86,60 +89,139 @@ func (s *Scanner) Scan(ctx context.Context, targets []string) error {
 		return err
 	}
 
-	stats, err := s.scanTree(ctx, ScanStats{}, *tree)
-	if err != nil {
+	s.total = ScanStats{}
+	s.walkers = nil
+	if s.Concurrency > 1 {
+		s.walkers = make(chan struct{}, s.Concurrency-1)
+	}
+
+	if err := s.scanTree(ctx, *tree); err != nil {
 		return err
 	}
+
+	s.mu.Lock()
+	stats := s.total
+	s.mu.Unlock()
 
 	s.Result("", stats)
 	debug.Log("result: %+v", stats)
 	return nil
 }
 
+// add counts an item and reports the new total. Reporting while holding the
+// lock keeps the reported totals growing even when entries finish out of order.
+func (s *Scanner) add(item string, delta ScanStats) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.total.Files += delta.Files
+	s.total.Dirs += delta.Dirs
+	s.total.Others += delta.Others
+	s.total.Bytes += delta.Bytes
+	s.Result(item, s.total)
+}
+
 // explicit is true when this path was an explicit backup target (same meaning as tree.Explicit on a leaf).
-func (s *Scanner) scan(ctx context.Context, stats ScanStats, target string, explicit bool) (ScanStats, error) {
+func (s *Scanner) scan(ctx context.Context, target string, explicit bool) error {
 	if ctx.Err() != nil {
-		return stats, nil
+		return nil
 	}
 
 	// exclude files by path before running stat to reduce number of lstat calls
 	if !explicit && !s.SelectByName(target) {
-		return stats, nil
+		return nil
 	}
 
 	// get file information
 	fi, err := s.FS.Lstat(target)
 	if err != nil {
-		return stats, s.Error(target, err)
+		return s.Error(target, err)
 	}
 
 	// run remaining select functions that require file information
 	if !explicit && !s.Select(target, fi, s.FS) {
-		return stats, nil
+		return nil
 	}
 
 	switch {
 	case fi.Mode.IsRegular():
-		stats.Files++
-		stats.Bytes += uint64(fi.Size)
+		s.add(target, ScanStats{Files: 1, Bytes: uint64(fi.Size)})
 	case fi.Mode.IsDir():
 		names, err := fs.Readdirnames(s.FS, target, fs.O_NOFOLLOW)
 		if err != nil {
-			return stats, s.Error(target, err)
+			return s.Error(target, err)
 		}
 		sort.Strings(names)
 
-		for _, name := range names {
-			stats, err = s.scan(ctx, stats, s.FS.Join(target, name), false)
-			if err != nil {
-				return stats, err
-			}
+		if err := s.scanEntries(ctx, target, names); err != nil {
+			return err
 		}
-		stats.Dirs++
+		s.add(target, ScanStats{Dirs: 1})
 	default:
-		stats.Others++
+		s.add(target, ScanStats{Others: 1})
 	}
 
-	s.Result(target, stats)
-	return stats, nil
+	return nil
+}
+
+// scanEntries scans the entries of a directory, handing them to free walkers
+// and scanning them inline otherwise, and returns once all of them are done.
+func (s *Scanner) scanEntries(ctx context.Context, dir string, names []string) error {
+	var (
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+		firstErr error
+	)
+	scanEntry := func(pathname string) {
+		err := s.scan(ctx, pathname, false)
+
+		mu.Lock()
+		defer mu.Unlock()
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	failed := func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return firstErr != nil
+	}
+
+	for _, name := range names {
+		if failed() {
+			break
+		}
+
+		pathname := s.FS.Join(dir, name)
+		if !s.tryStartWalker() {
+			scanEntry(pathname)
+			continue
+		}
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer s.stopWalker()
+			scanEntry(pathname)
+		}()
+	}
+
+	wg.Wait()
+	return firstErr
+}
+
+func (s *Scanner) tryStartWalker() bool {
+	if s.walkers == nil {
+		return false
+	}
+	select {
+	case s.walkers <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Scanner) stopWalker() {
+	<-s.walkers
 }
