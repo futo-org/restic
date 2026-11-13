@@ -5,7 +5,7 @@ on:
     branches:
       - 'futo/**'
     tags:
-      - 'v*+futo.*'
+      - 'v*\+futo.*'
   workflow_dispatch:
 
 permissions: {}
