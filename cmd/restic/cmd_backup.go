@@ -91,6 +91,7 @@ Exit status is 12 if the password is incorrect.
 // BackupOptions bundles all options for the backup command.
 type BackupOptions struct {
 	filter.ExcludePatternOptions
+	ExcludeScopedGlobs []string
 
 	Parent            string
 	GroupBy           data.SnapshotGroupByOptions
@@ -135,6 +136,7 @@ func (opts *BackupOptions) AddFlags(f *pflag.FlagSet) {
 	f.StringArrayVar(&opts.ExcludeIfPresent, "exclude-if-present", nil, "takes `filename[:header]`, exclude contents of directories containing filename (except filename itself) if header of that file is as provided (can be specified multiple times)")
 	f.BoolVar(&opts.ExcludeCaches, "exclude-caches", false, `excludes cache directories that are marked with a CACHEDIR.TAG file. See https://bford.info/cachedir/ for the Cache Directory Tagging Standard`)
 	f.StringVar(&opts.ExcludeLargerThan, "exclude-larger-than", "", "max `size` of the files to be backed up (allowed suffixes: k/K, m/M, g/G, t/T)")
+	f.StringArrayVar(&opts.ExcludeScopedGlobs, "iexclude-scoped-glob", nil, "exclude items under one of `scope`'s paths that match one of its case-insensitive globset patterns, given as JSON {\"paths\":[...],\"patterns\":[...]} (can be specified multiple times)")
 	f.BoolVar(&opts.Stdin, "stdin", false, "read backup from stdin")
 	f.StringVar(&opts.StdinFilename, "stdin-filename", "stdin", "`filename` to use when reading from stdin")
 	f.BoolVar(&opts.StdinCommand, "stdin-from-command", false, "interpret arguments as command to execute and store its stdout")
@@ -352,6 +354,15 @@ func collectRejectByNameFuncs(opts BackupOptions, repo *repository.Repository, w
 	}
 	for _, pat := range fsPatterns {
 		fs = append(fs, archiver.RejectByNameFunc(pat))
+	}
+
+	for _, spec := range opts.ExcludeScopedGlobs {
+		f, err := rejectByScopedGlob(spec)
+		if err != nil {
+			return nil, err
+		}
+
+		fs = append(fs, f)
 	}
 
 	return fs, nil

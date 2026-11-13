@@ -401,6 +401,86 @@ func TestBackupExclude(t *testing.T) {
 		"expected file %q not in first snapshot, but it's included", "passwords.txt")
 }
 
+func TestBackupExcludeScopedGlob(t *testing.T) {
+	env, cleanup := withTestEnvironment(t)
+	defer cleanup()
+
+	testRunInit(t, env.gopts)
+
+	datadir := filepath.Join(env.base, "testdata")
+	for _, filename := range []string{
+		"photos/a.jpg",
+		"photos/._a.jpg",
+		"photos/@eaDir/a.jpg/thumb.jpg",
+		"photos/Sub/RAW/b.cr2",
+		"photos/sub/archive.ZIP",
+		"photos/Trash/c.jpg",
+		"photos/#recycle/d.jpg",
+		"videos/raw/e.mov",
+		"videos/f.tmp",
+		"other/@eaDir/g.jpg",
+		"other/h.zip",
+	} {
+		fp := filepath.Join(datadir, filename)
+		rtest.OK(t, os.MkdirAll(filepath.Dir(fp), 0755))
+		rtest.OK(t, os.WriteFile(fp, []byte(filename), 0o666))
+	}
+
+	photos := filepath.Join(datadir, "photos")
+	videos := filepath.Join(datadir, "videos")
+	opts := BackupOptions{ExcludeScopedGlobs: []string{
+		`{"paths":["` + photos + `"],"patterns":["**/@eaDir/**","**/._*","**/#recycle/**","**/raw/**","*.zip","**/trash"]}`,
+		`{"paths":["` + videos + `"],"patterns":["**/*.TMP"]}`,
+	}}
+	testRunBackup(t, filepath.Dir(env.testdata), []string{"testdata"}, opts, env.gopts)
+	_, snapshotID := lastSnapshot(map[string]struct{}{}, loadSnapshotMap(t, env.gopts))
+	files := testRunLs(t, env.gopts, snapshotID)
+
+	for _, kept := range []string{
+		"/testdata/photos/a.jpg",
+		"/testdata/photos/sub",
+		"/testdata/videos/raw/e.mov",
+		"/testdata/other/@eaDir/g.jpg",
+		"/testdata/other/h.zip",
+	} {
+		rtest.Assert(t, includes(files, kept), "expected %q in snapshot, but it's not included", kept)
+	}
+
+	for _, excluded := range []string{
+		"/testdata/photos/._a.jpg",
+		"/testdata/photos/@eaDir/a.jpg",
+		"/testdata/photos/@eaDir/a.jpg/thumb.jpg",
+		"/testdata/photos/Sub/RAW/b.cr2",
+		"/testdata/photos/sub/archive.ZIP",
+		"/testdata/photos/Trash",
+		"/testdata/photos/Trash/c.jpg",
+		"/testdata/photos/#recycle/d.jpg",
+		"/testdata/videos/f.tmp",
+	} {
+		rtest.Assert(t, !includes(files, excluded), "expected %q not in snapshot, but it's included", excluded)
+	}
+}
+
+func TestBackupExcludeScopedGlobInvalid(t *testing.T) {
+	env, cleanup := withTestEnvironment(t)
+	defer cleanup()
+
+	testSetupBackupData(t, env)
+
+	for _, test := range []struct {
+		scope string
+		err   string
+	}{
+		{`{"paths":["/photos"],"patterns":["**/[z-a]"]}`, "--iexclude-scoped-glob: Invalid exclusion pattern '**/[z-a]': error parsing glob '**/[z-a]': invalid range; 'z' > 'a'"},
+		{`{"paths":["photos"],"patterns":["**/raw/**"]}`, `--iexclude-scoped-glob: path "photos" is not absolute`},
+		{`{"paths":`, "--iexclude-scoped-glob: unexpected end of JSON input"},
+	} {
+		opts := BackupOptions{ExcludeScopedGlobs: []string{test.scope}}
+		err := testRunBackupAssumeFailure(t, filepath.Dir(env.testdata), []string{"testdata"}, opts, env.gopts)
+		rtest.Assert(t, err != nil && err.Error() == "Fatal: "+test.err, "want error %q, got %v", test.err, err)
+	}
+}
+
 func TestBackupErrors(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		return

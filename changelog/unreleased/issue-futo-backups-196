@@ -1,0 +1,13 @@
+Enhancement: Exclude glob patterns scoped to a set of paths in `backup`
+
+Restic had no way to exclude files with patterns that use the semantics of the
+Rust globset crate, or to apply a set of patterns only below particular paths.
+
+Restic now supports `backup --iexclude-scoped-glob`, which takes one scope as
+JSON, for example `{"paths":["/mnt/photos"],"patterns":["**/@eaDir/**"]}`.
+Items under one of the scope's paths that match one of its patterns are
+excluded, and excluded directories are not descended into. Patterns follow
+globset: they match the full absolute path, ignore the case of ASCII letters,
+and `*` and `?` also match `/`. The option can be specified multiple times.
+
+https://github.com/futo-org/backups/issues/196
