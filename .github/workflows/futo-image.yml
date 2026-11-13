@@ -4,8 +4,6 @@ on:
   push:
     branches:
       - 'futo/**'
-    tags:
-      - 'v*\+futo.*'
   workflow_dispatch:
 
 permissions: {}
@@ -48,16 +46,16 @@ jobs:
           persist-credentials: false
 
       - id: version
-        name: Stamp the version with the release tag or the commit
+        name: Publish a new version as a release, anything else as a dev build
         run: |
-          futo=dev.${GITHUB_SHA::7}
-          if [[ $GITHUB_REF_TYPE == tag ]]; then
-            futo=${GITHUB_REF_NAME##*+futo.}
+          version=$(grep -oP '^const Version = "\K[^"]+\+futo\.[0-9]+(?="$)' internal/global/global.go)
+          image_tag=${version/+/-}
+          if docker manifest inspect "$IMAGE:$image_tag" >/dev/null 2>&1; then
+            sed -i -E "s/^const Version = \"([^\"]+)\"$/const Version = \"\1.dev.${GITHUB_SHA::7}\"/" internal/global/global.go
+            image_tag=
           fi
 
-          sed -i -E "s/^const Version = \"([^\"]+)\"$/const Version = \"\1+futo.$futo\"/" internal/global/global.go
-          version=$(grep -oP '^const Version = "\K[^"]+\+futo\.'"$futo"'(?="$)' internal/global/global.go)
-          echo "image-tag=${version/+/-}" >> "$GITHUB_OUTPUT"
+          echo "image-tag=$image_tag" >> "$GITHUB_OUTPUT"
 
       - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee
         with:
@@ -72,7 +70,7 @@ jobs:
           tags: |
             type=ref,event=branch
             type=sha
-            type=raw,value=${{ steps.version.outputs.image-tag }},enable=${{ github.ref_type == 'tag' }}
+            type=raw,value=${{ steps.version.outputs.image-tag }},enable=${{ steps.version.outputs.image-tag != '' }}
 
       - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd
 
